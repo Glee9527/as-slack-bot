@@ -1,68 +1,94 @@
-# intent.py
 import os
+import json
+from openai import OpenAI
 import re
-from typing import Dict, Any
 
-USE_GPT = bool(os.getenv("OPENAI_API_KEY"))
+print("DEBUG intent.py loaded from:", __file__)
 
-# --- 規則解析 ---
+KEYWORDS_LICENSE = ["license", "licenses", "授權", "到期"]
 
-def parse_intent_rules(text: str) -> Dict[str, Any]:
-    t = text.strip().lower()
+def parse_intent(text: str):
+    # 清理 Slack 可能加的 Markdown 標記
+    cleaned = text.strip("*_`")
+    text_lower = cleaned.lower()
+    print("DEBUG cleaned text:", text_lower)
 
-    # license expiry
-    if any(k in t for k in ["license", "licence", "到期", "過期", "expire", "expiring"]):
-        # 抽出天數（30, 60... 支援中文/英文）
-        m = re.search(r"(\d+)[\s\-]*(day|days|天)", t)
-        days = int(m.group(1)) if m else 30
-        return {"intent": "license_expiry", "days": days}
+    # --- 強制規則 ---
+    if re.search(r"(license|licenses|授權|到期)", text_lower):
+        days = 30
+        match = re.search(r"(\d+)", text_lower)
+        if match:
+            days = int(match.group(1))
+        intent = {
+            "intent": "license_expiry",
+            "days": days,
+            "fields": ["asset_name", "ain", "serial_number", "purchased_on", "assigned_to_user_name"],
+        }
+        print("DEBUG intent (forced license):", intent)
+        return intent
 
-    # old laptops
-    if any(k in t for k in ["laptop", "notebook", "筆電", "電腦"]):
-        m = re.search(r"(\d+)\s*(year|years|年)", t)
-        years = int(m.group(1)) if m else 3
-        if any(k in t for k in ["old", "over", "older", "超過", ">", "大於"]):
-            return {"intent": "old_laptops", "years": years}
+    # fallback
+    return {"intent": "user_or_asset_lookup", "query": text, "fields": []}
 
-    # default: user or asset lookup
-    return {"intent": "user_or_asset_lookup", "query": text.strip()}
+    # --- 需要 GPT 的情況才初始化 client ---
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("⚠️ WARNING: OPENAI_API_KEY not set, fallback to user_or_asset_lookup")
+        return {
+            "intent": "user_or_asset_lookup",
+            "query": text,
+            "fields": ["asset_name", "ain", "serial_number", "purchased_on", "assigned_to_user_name"],
+        }
 
-# --- （可選）GPT 解析：當規則不確定時強化 ---
+    client = OpenAI(api_key=api_key)
 
-def parse_intent_gpt(text: str) -> Dict[str, Any]:
-    if not USE_GPT:
-        return parse_intent_rules(text)
+    system_prompt = """You are an intent parser for an IT asset management bot.
+The user may type queries in Chinese, English, or mixed.
+Always normalize into structured JSON in English.
+
+Supported intents:
+- user_or_asset_lookup
+- license_expiry
+- old_laptops
+- location_assets
+- group_assets
+- vendor_assets
+- age_assets
+
+Fields you may extract:
+- query: for user_or_asset_lookup
+- days: for license_expiry (integer)
+- years: for old_laptops / age_assets (integer)
+- location: for location_assets
+- group: for group_assets (Mac/Windows)
+- vendor: for vendor_assets
+- fields: list of requested fields
+
+Rules:
+1. Always return valid JSON only.
+2. Default fields = ["asset_name","ain","serial_number","purchased_on","assigned_to_user_name"].
+3. If parsing fails, fallback to {"intent":"user_or_asset_lookup","query":<text>}.
+"""
+
+    user_prompt = f"User query: {text}\nReturn intent JSON only."
 
     try:
-        from openai import OpenAI
-        client = OpenAI()
-        sys = (
-            "Extract a JSON with keys: intent(one of: license_expiry, old_laptops, user_or_asset_lookup), "
-            "days(optional), years(optional), query(optional). The user may speak Chinese or English."
-        )
-        msg = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": text}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0
+            temperature=0,
         )
-        content = msg.choices[0].message.content
-        # 嘗試提取 JSON（為簡化起見，假設模型直接回 JSON）
-        import json
-        data = json.loads(content)
-        return data
-    except Exception:
-        return parse_intent_rules(text)
+        intent = json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        print("DEBUG intent (GPT error):", e)
+        intent = {
+            "intent": "user_or_asset_lookup",
+            "query": text,
+            "fields": ["asset_name", "ain", "serial_number", "purchased_on", "assigned_to_user_name"],
+        }
 
-
-def parse_intent(text: str) -> Dict[str, Any]:
-    # 先規則 → 再 GPT（可選）
-    base = parse_intent_rules(text)
-    if base.get("intent") == "user_or_asset_lookup" and USE_GPT:
-        g = parse_intent_gpt(text)
-        # 若 GPT 判斷出別的意圖就採用
-        if g.get("intent") != "user_or_asset_lookup":
-            return g
-    return base
+    print("DEBUG intent (GPT):", intent)
+    return intent

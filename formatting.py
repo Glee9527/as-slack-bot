@@ -1,17 +1,11 @@
-# formatting.py
-from typing import Dict, List
+from typing import List, Dict
 import csv
 import tempfile
 import os
-
-
-def _pair(label, value):
-    """格式化一行文字，處理空值"""
-    return f"*{label}*：{value if value else '-'}"
+from datetime import datetime
 
 
 def _write_csv(headers: List[str], rows: List[List[str]], prefix="report"):
-    """生成臨時 CSV 檔案，回傳檔案路徑"""
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=".csv")
     os.close(fd)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -21,105 +15,115 @@ def _write_csv(headers: List[str], rows: List[List[str]], prefix="report"):
     return path
 
 
-# ---------------------------
-# 使用者 / 資產查詢
-# ---------------------------
-def format_user_assets(query: str, data: Dict):
-    user = data.get("user")
-    assets = data.get("assets") or []
-
-    header = {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": f"查詢：`{query}`"}
-    }
-
-    if user:
-        uname = user.get("name") or user.get("full_name") or user.get("email")
-        ublock = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"👤 *User Name*：{uname}"}
-        }
-    else:
-        ublock = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "未找到對應使用者，改以資產匹配。"}
-        }
+def format_assets_list(title: str, assets: List[Dict], fields=None):
+    default_fields = ["asset_name", "ain", "serial_number", "purchased_on", "assigned_to_user_name"]
+    fields = fields or default_fields
+    count = len(assets or [])
+    header = {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}* (found: {count})"}}
 
     if not assets:
-        return [header, ublock, {"type": "section", "text": {"type": "mrkdwn", "text": "找不到資產。"}}], None
-
-    blocks = [header, ublock, {"type": "divider"}]
+        return [header, {"type": "section", "text": {"type": "mrkdwn", "text": "No assets found."}}], None
 
     rows = []
-    for a in assets[:10]:  # 最多列 10 筆
-        name = a.get("name")
-        serial = a.get("serial_number") or a.get("serial")
-        pd = a.get("purchase_date") or a.get("purchased_on")
-        ain = a.get("asset_number") or a.get("ain") or a.get("tag") or a.get("id")
+    for a in assets:
+        row = []
+        if "asset_name" in fields:
+            row.append(a.get("name"))
+        if "ain" in fields:
+            row.append(a.get("identifier"))
+        if "serial_number" in fields:
+            row.append(a.get("bios_serial_number"))
+        if "purchased_on" in fields:
+            row.append(a.get("purchased_on"))
+        if "location" in fields:
+            row.append(a.get("location_name"))
+        if "vendor" in fields:
+            row.append(a.get("manufacturer"))
+        if "assigned_to_user_name" in fields or "assigned_to_user_email" in fields:
+            row.append(a.get("assigned_to_user_name"))
+            row.append(a.get("assigned_to_user_email"))
+        rows.append(row)
 
-        desc = "\n".join([
-            _pair("💻 Asset Name", name),
-            _pair("🔑 Serial Number", serial),
-            _pair("📅 Purchased On", pd),
-            _pair("🏷️ AIN", ain),
-        ])
+    if count > 10:  # 超過10筆才產生 CSV
+        csv_path = _write_csv(fields, rows, prefix="assets")
+        blocks = [
+            header,
+            {"type": "section", "text": {"type": "mrkdwn", "text": "⚠️ Too many results. CSV uploaded (no preview)."}}
+        ]
+        return blocks, csv_path
 
+    # <=10 筆 → 直接顯示在 Slack，不產生 CSV
+    blocks = [header, {"type": "divider"}]
+    for a in assets:
+        desc_parts = []
+        if "asset_name" in fields:
+            desc_parts.append(f"*Asset Name*: {a.get('name') or '-'}")
+        if "ain" in fields:
+            desc_parts.append(f"*AIN*: {a.get('identifier') or '-'}")
+        if "serial_number" in fields:
+            desc_parts.append(f"*Serial Number*: {a.get('bios_serial_number') or '-'}")
+        if "purchased_on" in fields:
+            desc_parts.append(f"*Purchased On*: {a.get('purchased_on') or '-'}")
+        if "location" in fields:
+            desc_parts.append(f"*Location*: {a.get('location_name') or '-'}")
+        if "vendor" in fields:
+            desc_parts.append(f"*Vendor*: {a.get('manufacturer') or '-'}")
+        if "assigned_to_user_name" in fields or "assigned_to_user_email" in fields:
+            desc_parts.append(
+                f"*Assigned To*: {a.get('assigned_to_user_name') or '-'} ({a.get('assigned_to_user_email') or '-'})"
+            )
+        desc = "\n".join(desc_parts)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": desc}})
         blocks.append({"type": "divider"})
-
-        rows.append([name, serial, pd, ain])
-
-    csv_path = _write_csv(["Asset Name", "Serial Number", "Purchased On", "AIN"], rows, prefix="assets")
-    return blocks, csv_path
+    return blocks, None
 
 
-# ---------------------------
-# License 到期清單
-# ---------------------------
 def format_licenses_expiring(days: int, items: List[Dict]):
-    header = {"type": "section", "text": {"type": "mrkdwn", "text": f"⚠️ *以下 License 將於 {days} 天內到期*"}}
+    count = len(items or [])
+    header = {"type": "section", "text": {"type": "mrkdwn", "text": f":warning: *{count} licenses expiring within {days} days*"}}
 
     if not items:
-        return [header, {"type": "section", "text": {"type": "mrkdwn", "text": "沒有快到期的 license。"}}], None
+        return [header, {"type": "section", "text": {"type": "mrkdwn", "text": "No expiring licenses."}}], None
 
-    blocks = [header, {"type": "divider"}]
-
+    today = datetime.utcnow().date()
     rows = []
-    for lic in items[:20]:
-        name = lic.get("name")
-        exp = lic.get("expires_on")
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"• *{name}*（到期日：{exp})"}
-        })
-        rows.append([name, exp])
+    for lic in items:
+        expiry_str = lic.get("expires_on")
+        expiry = None
+        try:
+            if expiry_str:
+                expiry = datetime.fromisoformat(expiry_str).date()
+        except Exception:
+            pass
+        remain = (expiry - today).days if expiry else None
+        rows.append([lic.get("name"), expiry_str, remain if remain is not None else ""])
 
-    csv_path = _write_csv(["License Name", "Expires On"], rows, prefix="licenses")
-    return blocks, csv_path
+    if count > 10:  # 超過10筆才產生 CSV
+        csv_path = _write_csv(["License Name", "Expires On", "Days Remaining"], rows, prefix="licenses")
+        blocks = [
+            header,
+            {"type": "section", "text": {"type": "mrkdwn", "text": "⚠️ Too many results. CSV uploaded (no preview)."}}
+        ]
+        return blocks, csv_path
 
-
-# ---------------------------
-# 老舊筆電清單
-# ---------------------------
-def format_old_laptops(years: int, items: List[Dict]):
-    header = {"type": "section", "text": {"type": "mrkdwn", "text": f"🖥️ *以下筆電已超過 {years} 年*"}}
-
-    if not items:
-        return [header, {"type": "section", "text": {"type": "mrkdwn", "text": "沒有符合條件的筆電。"}}], None
-
+    # <=10 筆 → 直接顯示在 Slack
     blocks = [header, {"type": "divider"}]
-
-    rows = []
-    for a in items[:20]:
-        name = a.get("name")
-        sn = a.get("serial")
-        pd = a.get("purchased_on") or a.get("purchased_date") or a.get("purchase_date")
-        ain = a.get("ain")
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"• *{name}* — Serial: `{sn}`，購買日：{pd}，AIN：`{ain}`"}
-        })
-        rows.append([name, sn, pd, ain])
-
-    csv_path = _write_csv(["Asset Name", "Serial Number", "Purchased On", "AIN"], rows, prefix="old_laptops")
-    return blocks, csv_path
+    for lic in items:
+        expiry_str = lic.get("expires_on")
+        expiry = None
+        try:
+            if expiry_str:
+                expiry = datetime.fromisoformat(expiry_str).date()
+        except Exception:
+            pass
+        remain = (expiry - today).days if expiry else None
+        desc_parts = [
+            f"*License*: {lic.get('name') or '-'}",
+            f"*Expires On*: {expiry_str or '-'}",
+        ]
+        if remain is not None:
+            desc_parts.append(f"*Days Remaining*: {remain} days")
+        desc = "\n".join(desc_parts)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": desc}})
+        blocks.append({"type": "divider"})
+    return blocks, None
