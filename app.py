@@ -184,7 +184,6 @@ def handle_asset_command(ack, body, client, logger):
 
 
 @flask_app.route("/slack/events", methods=["POST"])
-@flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
     # Slack URL 驗證
     data = request.get_json(silent=True)
@@ -194,6 +193,15 @@ def slack_events():
     # 其他 Slack event 正常處理
     return handler.handle(request)
 
+# --- Health check for Render / UptimeRobot ---
+@flask_app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
+
+# (可選) 根路由也回應，方便快速檢查
+@flask_app.route("/", methods=["GET"])
+def root():
+    return "running", 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
