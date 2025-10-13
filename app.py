@@ -184,7 +184,14 @@ def handle_asset_command(ack, body, client, logger):
 
 
 @flask_app.route("/slack/events", methods=["POST"])
+@flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
+    # Slack URL 驗證
+    data = request.get_json(silent=True)
+    if data and data.get("type") == "url_verification":
+        return {"challenge": data.get("challenge")}, 200
+
+    # 其他 Slack event 正常處理
     return handler.handle(request)
 
 
