@@ -27,8 +27,18 @@ def parse_intent(text: str):
         print("DEBUG intent (forced license):", intent)
         return intent
 
-    # fallback
-    return {"intent": "user_or_asset_lookup", "query": text, "fields": []}
+    # --- 強制規則 for location ---
+    loc_match = re.search(r"\b([A-Z]{2})\b", text_upper := cleaned.upper())
+    if ("device" in text_lower or "設備" in text_lower) and loc_match:
+        loc = loc_match.group(1)
+        intent = {
+            "intent": "location_assets",
+            "location": loc,
+            "fields": ["asset_name", "ain", "serial_number", "purchased_on", "assigned_to_user_name"],
+        }
+        print("DEBUG intent (forced location):", intent)
+        return intent
+
 
     # --- 需要 GPT 的情況才初始化 client ---
     api_key = os.getenv("OPENAI_API_KEY")

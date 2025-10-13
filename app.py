@@ -21,10 +21,9 @@ import assetsonar as AS
 import formatting as FX
 from slack_upload import upload_csv_to_slack
 
-# Load environment variables
+# Load env
 load_dotenv()
 
-# Initialize Slack + Flask
 app = App(
     token=os.getenv("SLACK_BOT_TOKEN"),
     signing_secret=os.getenv("SLACK_SIGNING_SECRET"),
@@ -39,15 +38,6 @@ def handle_asset_command(ack, body, client, logger):
     text = (body.get("text") or "").strip()
     channel_id = body.get("channel_id")
 
-    if not text:
-        client.chat_postEphemeral(
-            channel=channel_id,
-            user=body.get("user_id"),
-            text="Please enter a query, e.g. `/asset George Li` or `assets older than 3 years`"
-        )
-        return
-
-    # Step 1: post "Searching..." message (root of thread)
     searching_msg = client.chat_postMessage(
         channel=channel_id,
         text=":mag: Searching, please wait..."
@@ -55,61 +45,118 @@ def handle_asset_command(ack, body, client, logger):
     thread_ts = searching_msg["ts"]
 
     try:
+        # ✅ Debug 分支必須在 intent parser 之前
+        if text.lower().startswith("debug olddevices"):
+            from datetime import datetime, timedelta
+            yrs = 3
+            cutoff = datetime.utcnow().date() - timedelta(days=365 * yrs)
+            all_assets = []
+            page = 1
+            while True:
+                data = AS._get("assets.api", params={"page": page, "limit": 200})
+                assets = data.get("assets", [])
+                if not assets:
+                    break
+                all_assets.extend(assets)
+                if page >= data.get("total_pages", 1):
+                    break
+                page += 1
+
+            rows = []
+            for a in all_assets:
+                name = (a.get("name") or "")
+                pd_raw = a.get("purchased_on")
+                pd = AS.parse_date(pd_raw)
+                if any(b in name.lower() for b in ["apple", "lenovo", "dell", "hp"]):
+                    rows.append([name, pd_raw or "-", str(pd or "-"), str(cutoff)])
+
+            if not rows:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text="No candidate devices found."
+                )
+            else:
+                csv_path = FX.write_csv(
+                    ["Asset Name", "Purchased On (raw)", "Parsed", "Cutoff"],
+                    rows,
+                    prefix="debug_olddevices"
+                )
+                permalink = upload_csv_to_slack(csv_path, channel_id, title="Debug Old Devices", thread_ts=thread_ts)
+                if permalink:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        text=f"📎 Debug CSV uploaded: {permalink}"
+                    )
+            return
+
+        # === 正常 intent parser 流程 ===
         intent_data = intent.parse_intent(text)
         itype = intent_data.get("intent")
         fields = intent_data.get("fields")
-        print("DEBUG intent detected:", json.dumps(intent_data, ensure_ascii=False))
 
         blocks, csv_path = None, None
 
+        # === 查詢分支 ===
         if itype == "user_or_asset_lookup":
             q = intent_data.get("query")
             data = AS.find_user_assets(q)
-            blocks, csv_path = FX.format_assets_list(f"Results for {q}", data.get("assets", []), fields=fields)
+            blocks, csv_path = FX.format_assets_list(
+                f"Results for your query: *{text}*",
+                data.get("assets", []),
+                fields=fields
+            )
 
         elif itype == "license_expiry":
             days = int(intent_data.get("days", 30))
             items = AS.licenses_expiring_within(days)
-            print(f"DEBUG license_expiry: days={days}, results={len(items)}")
             blocks, csv_path = FX.format_licenses_expiring(days, items)
+            if blocks and len(blocks) > 0:
+                blocks[0]["text"]["text"] = f"Results for your query: *{text}* (licenses expiring in {days} days)"
 
         elif itype == "old_laptops":
             years = int(intent_data.get("years", 3))
             items = AS.laptops_older_than(years)
-            print(f"DEBUG old_laptops: years={years}, results={len(items)}")
             blocks, csv_path = FX.format_old_laptops(years, items, fields=fields)
-
+            if blocks and len(blocks) > 0:
+                blocks[0]["text"]["text"] = f"Results for your query: *{text}* (laptops older than {years} years)"
+                
         elif itype == "location_assets":
             loc = intent_data.get("location")
             items = AS.find_assets_by_location(loc)
             print(f"DEBUG location_assets: location={loc}, results={len(items)}")
-            blocks, csv_path = FX.format_assets_list(f"Assets in location {loc}", items, fields=fields)
-
-        elif itype == "group_assets":
-            grp = intent_data.get("group")
-            items = AS.find_assets_by_group(grp)
-            print(f"DEBUG group_assets: group={grp}, results={len(items)}")
-            blocks, csv_path = FX.format_assets_list(f"{grp.capitalize()} assets", items, fields=fields)
-
-        elif itype == "vendor_assets":
-            ven = intent_data.get("vendor")
-            items = AS.find_assets_by_vendor(ven)
-            print(f"DEBUG vendor_assets: vendor={ven}, results={len(items)}")
-            blocks, csv_path = FX.format_assets_list(f"Assets from vendor {ven}", items, fields=fields)
+            blocks, csv_path = FX.format_assets_list(
+                f"Results for your query: *{text}* (location={loc})",
+                items,
+                fields=fields
+            )
 
         elif itype == "age_assets":
             yrs = int(intent_data.get("years", 3))
-            items = AS.find_assets_by_age(yrs)
-            print(f"DEBUG age_assets: years={yrs}, results={len(items)}")
-            blocks, csv_path = FX.format_assets_list(f"Assets older than {yrs} years", items, fields=fields)
+            items = AS.devices_older_than(yrs)
+            print("DEBUG devices_older_than returned:", len(items))
+            for dev in items:
+                print("DEBUG match:", dev.get("name"), dev.get("purchased_on"))
+            blocks, csv_path = FX.format_assets_list(
+                f"Results for your query: *{text}*",
+                items,
+                fields=fields
+            )
 
         else:
-            print("DEBUG intent fallback → unknown intent")
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"❓ Sorry, I could not understand: {text}"}}
             ]
 
-        # Step 2: reply results in the same thread
+        # === 更新 root 訊息 ===
+        client.chat_update(
+            channel=channel_id,
+            ts=thread_ts,
+            text="✅ Search completed. See results in thread"
+        )
+
+        # === 在 thread 裡回覆結果 ===
         client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
@@ -117,17 +164,15 @@ def handle_asset_command(ack, body, client, logger):
             blocks=blocks
         )
 
-        # Step 3: Upload CSV if provided
+        # === 上傳 CSV （如有需要） ===
         if csv_path:
-            resp = upload_csv_to_slack(csv_path, channel_id, title="Results CSV", thread_ts=thread_ts)
-            if resp and "file" in resp:
-                permalink = resp["file"].get("permalink")
-                if permalink:
-                    client.chat_postMessage(
-                        channel=channel_id,
-                        thread_ts=thread_ts,
-                        text=f"📎 [Download CSV here]({permalink})"
-                    )
+            permalink = upload_csv_to_slack(csv_path, channel_id, title="Results CSV", thread_ts=thread_ts)
+            if permalink:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"📎 [Download CSV here]({permalink})"
+                )
 
     except Exception as e:
         logger.exception(e)
