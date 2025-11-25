@@ -5,6 +5,25 @@ import re
 
 print("DEBUG intent.py loaded from:", __file__)
 
+# --- 新增：Email 偵測與強制規則 ---
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+FORCED_EMAIL_FIELDS = [
+    "asset_name",
+    "ain",
+    "serial_number",
+    "purchased_on",
+    "assigned_to_user_name",
+    "assigned_to_user_email",
+]
+
+def _forced_email_intent(email: str):
+    """建立強制 email 規則的 intent 結構"""
+    return {
+        "intent": "user_or_asset_lookup",
+        "query": email,
+        "fields": FORCED_EMAIL_FIELDS,
+    }
+
 KEYWORDS_LICENSE = ["license", "licenses", "授權", "到期"]
 
 def parse_intent(text: str):
@@ -12,6 +31,17 @@ def parse_intent(text: str):
     cleaned = text.strip("*_`")
     text_lower = cleaned.lower()
     print("DEBUG cleaned text:", text_lower)
+
+    # --- 強制規則：Email ---
+    m = EMAIL_RE.search(text or "")
+    if m:
+        email = m.group(0)
+        intent = _forced_email_intent(email)
+        try:
+            print("DEBUG intent (forced email):", intent)
+        except Exception:
+            pass
+        return intent
 
     # --- 強制規則 ---
     if re.search(r"(license|licenses|授權|到期)", text_lower):
@@ -38,7 +68,6 @@ def parse_intent(text: str):
         }
         print("DEBUG intent (forced location):", intent)
         return intent
-
 
     # --- 需要 GPT 的情況才初始化 client ---
     api_key = os.getenv("OPENAI_API_KEY")
