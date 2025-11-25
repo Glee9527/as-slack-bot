@@ -12,11 +12,10 @@ ssl._create_default_https_context = lambda *args, **kwargs: ssl.create_default_c
 
 import json
 import os
-import re  # ✅ 新增：用於判斷 AIN/序號
+import re
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
-from dotenv import load_dotenv
 
 import assetsonar as AS
 import formatting as FX
@@ -35,13 +34,13 @@ flask_app = Flask(__name__)
 
 @app.command("/asset")
 def handle_asset_command(ack, body, client, logger):
-    # 先 ACK（避免 3 秒超時）
+    # ACK quickly to avoid 3s timeout
     ack()
 
     text = (body.get("text") or "").strip()
     channel_id = body.get("channel_id")
 
-    # 發一則訊息作為 thread anchor
+    # anchor message for the thread
     searching_msg = client.chat_postMessage(
         channel=channel_id,
         text=":mag: Searching, please wait..."
@@ -49,7 +48,7 @@ def handle_asset_command(ack, body, client, logger):
     thread_ts = searching_msg["ts"]
 
     try:
-        # ✅ Debug 分支必須在 intent parser 之前
+        # --- Debug path (kept) ---
         if text.lower().startswith("debug olddevices"):
             from datetime import datetime, timedelta
             yrs = 3
@@ -95,18 +94,17 @@ def handle_asset_command(ack, body, client, logger):
                     )
             return
 
-        # === 正常 intent parser 流程 ===
+        # --- Normal intent flow ---
         intent_data = intent.parse_intent(text)
         itype = intent_data.get("intent")
         fields = intent_data.get("fields")
 
         blocks, csv_path = None, None
 
-        # === 查詢分支 ===
         if itype == "user_or_asset_lookup":
             q = (intent_data.get("query") or text or "").strip()
 
-            # 路徑 A：Email（intent 方案A已抽乾淨，這裡仍保底判斷）
+            # A) Email → server-side lookup
             if "@" in q:
                 data = AS.find_user_assets(q)
                 assets = data.get("assets", [])
@@ -117,7 +115,7 @@ def handle_asset_command(ack, body, client, logger):
                 )
 
             else:
-                # 路徑 B：AIN / 序號 → 仍走 find_user_assets（內含 quick_search）
+                # B) AIN / Serial → quick_search path inside AS.find_user_assets
                 is_ain = re.match(r"^[A-Za-z]{2}\d{3,}$", q)
                 is_serial = len(q) > 6 and q.isalnum()
                 if is_ain or is_serial:
@@ -129,25 +127,23 @@ def handle_asset_command(ack, body, client, logger):
                         fields=fields
                     )
                 else:
-                    # 路徑 C：姓名 → 先跑「姓名消歧」：唯一命中直接回資產，多位則出下拉清單（只顯示姓名與 email）
+                    # C) Name → disambiguation (name + email only)
                     res = AS.find_assets_by_person_name(q, include_custom_fields=False)
 
-                    if res.get("assets"):  # 唯一命中
+                    if res.get("assets"):  # unique member found
                         m = res.get("member") or {}
                         full_name = ("{} {}".format(m.get("first_name") or "", m.get("last_name") or "")).strip()
                         email = m.get("email") or ""
                         assets = res["assets"]
-
                         blocks, csv_path = FX.format_assets_list(
                             f"Results for your query: *{text}* (member: {full_name} <{email}>)",
                             assets,
                             fields=fields
                         )
-
                     else:
                         candidates = res.get("candidates") or []
                         if candidates:
-                            # 建立只含「姓名 — email」的 static_select
+                            # build static_select with name — email only
                             options = []
                             for c in candidates:
                                 full_name = ("{} {}".format(c.get("first_name") or "", c.get("last_name") or "")).strip() or "(no name)"
@@ -158,7 +154,6 @@ def handle_asset_command(ack, body, client, logger):
                                     "value": value
                                 })
 
-                            # 直接在 thread 送出消歧清單並提前結束
                             client.chat_update(
                                 channel=channel_id,
                                 ts=thread_ts,
@@ -167,11 +162,11 @@ def handle_asset_command(ack, body, client, logger):
                             client.chat_postMessage(
                                 channel=channel_id,
                                 thread_ts=thread_ts,
-                                text=f"我找到多位「{q}」，請選擇正確的人：",
+                                text=f"Found multiple matches for *{q}*. Please choose the correct person:",
                                 blocks=[
                                     {
                                         "type": "section",
-                                        "text": {"type": "mrkdwn", "text": f"我找到多位 *{q}*，請選擇正確的人（只顯示姓名與 email）："}
+                                        "text": {"type": "mrkdwn", "text": f"Found multiple matches for *{q}*. Please choose the correct person (name + email only):"}
                                     },
                                     {
                                         "type": "actions",
@@ -179,7 +174,7 @@ def handle_asset_command(ack, body, client, logger):
                                             {
                                                 "type": "static_select",
                                                 "action_id": "pick_member_for_assets",
-                                                "placeholder": {"type": "plain_text", "text": "選擇正確的人"},
+                                                "placeholder": {"type": "plain_text", "text": "Choose a person"},
                                                 "options": options
                                             }
                                         ]
@@ -188,9 +183,11 @@ def handle_asset_command(ack, body, client, logger):
                             )
                             return
                         else:
-                            # 無候選
+                            # no candidates / no assets
                             blocks = [
-                                {"type": "section", "text": {"type": "mrkdwn", "text": f"找不到與「{q}」相關的人或資產。你可以改試 email、序號或 AIN。"}}
+                                {"type": "section",
+                                 "text": {"type": "mrkdwn",
+                                          "text": f'No people or assets found related to "{q}". Try an email, serial number, or AIN instead.'}}
                             ]
 
         elif itype == "license_expiry":
@@ -206,7 +203,7 @@ def handle_asset_command(ack, body, client, logger):
             blocks, csv_path = FX.format_old_laptops(years, items, fields=fields)
             if blocks and len(blocks) > 0:
                 blocks[0]["text"]["text"] = f"Results for your query: *{text}* (laptops older than {years} years)"
-                
+
         elif itype == "location_assets":
             loc = intent_data.get("location")
             items = AS.find_assets_by_location(loc)
@@ -231,17 +228,17 @@ def handle_asset_command(ack, body, client, logger):
 
         else:
             blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"❓ Sorry, I could not understand: {text}"}}
+                {"type": "section",
+                 "text": {"type": "mrkdwn", "text": f"❓ Sorry, I could not understand: {text}"}}
             ]
 
-        # === 更新 root 訊息 ===
+        # finalize
         client.chat_update(
             channel=channel_id,
             ts=thread_ts,
             text="✅ Search completed. See results in thread"
         )
 
-        # === 在 thread 裡回覆結果 ===
         client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
@@ -249,9 +246,7 @@ def handle_asset_command(ack, body, client, logger):
             blocks=blocks
         )
 
-        # === 上傳 CSV （如有需要） ===
         if csv_path:
-            # 按工具說明，請直接用本地檔案路徑；平台會轉成可下載連結
             permalink = upload_csv_to_slack(csv_path, channel_id, title="Results CSV", thread_ts=thread_ts)
             if permalink:
                 client.chat_postMessage(
@@ -269,29 +264,52 @@ def handle_asset_command(ack, body, client, logger):
         )
 
 
-# === 新增：處理姓名消歧選擇 ===
+# === Disambiguation action (name + email only) ===
 @app.action("pick_member_for_assets")
 def handle_pick_member_for_assets(ack, body, client, logger):
     ack()
     try:
+        # parse selection payload
         sel = body["actions"][0]["selected_option"]["value"]
         data = json.loads(sel)  # {"uid":..., "name":..., "email":...}
         uid = int(data["uid"])
         full_name = data.get("name") or ""
         email = data.get("email") or ""
 
-        channel_id = body["container"].get("channel_id") or body.get("channel", {}).get("id")
-        thread_ts = body["container"].get("message_ts") or body.get("message", {}).get("ts")
+        # safely resolve channel_id / thread_ts (avoid calling .get on str)
+        container = body.get("container")
+        if isinstance(container, dict):
+            channel_id = container.get("channel_id")
+            thread_ts = container.get("message_ts")
+        else:
+            channel_id = None
+            thread_ts = None
 
+        ch = body.get("channel")
+        if not channel_id:
+            if isinstance(ch, dict):
+                channel_id = ch.get("id")
+            elif isinstance(ch, str):
+                channel_id = ch
+
+        msg = body.get("message")
+        if not thread_ts and isinstance(msg, dict):
+            thread_ts = msg.get("ts")
+
+        if not thread_ts:
+            thread_ts = body.get("message_ts") or (container.get("message_ts") if isinstance(container, dict) else None)
+
+        # fetch assets for the selected member
         assets = AS.get_assets_possessions_of_user(uid, include_custom_fields=False, max_pages=10)
         if not assets:
             client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=f"「{full_name}」<{email}> 沒有找到資產。"
+                text=f"No assets found for {full_name} <{email}>."
             )
             return
 
+        # format and reply
         blocks, csv_path = FX.format_assets_list(
             f"Assets for *{full_name}* <{email}>",
             assets,
@@ -316,13 +334,30 @@ def handle_pick_member_for_assets(ack, body, client, logger):
     except Exception as e:
         logger.exception("pick_member_for_assets failed")
         try:
-            channel_id = body.get("channel", {}).get("id") or body.get("container", {}).get("channel_id")
-            thread_ts = body.get("container", {}).get("message_ts")
+            container = body.get("container")
+            if isinstance(container, dict):
+                channel_id = container.get("channel_id")
+                thread_ts = container.get("message_ts")
+            else:
+                channel_id = None
+                thread_ts = None
+
+            ch = body.get("channel")
+            if not channel_id:
+                if isinstance(ch, dict):
+                    channel_id = ch.get("id")
+                elif isinstance(ch, str):
+                    channel_id = ch
+
+            msg = body.get("message")
+            if not thread_ts and isinstance(msg, dict):
+                thread_ts = msg.get("ts")
+
             if channel_id:
                 client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=thread_ts,
-                    text=f"抱歉，處理你的選擇時發生錯誤：{e}"
+                    text=f"Sorry, something went wrong handling your selection: {e}"
                 )
         except Exception:
             pass
@@ -330,20 +365,16 @@ def handle_pick_member_for_assets(ack, body, client, logger):
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
-    # Slack URL 驗證
     data = request.get_json(silent=True)
     if data and data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}, 200
-
-    # 其他 Slack event 正常處理
     return handler.handle(request)
 
-# --- Health check for Render / UptimeRobot ---
+# --- Health checks ---
 @flask_app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
 
-# (可選) 根路由也回應，方便快速檢查
 @flask_app.route("/", methods=["GET"])
 def root():
     return "running", 200
