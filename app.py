@@ -269,21 +269,21 @@ def handle_asset_command(ack, body, client, logger):
 def handle_pick_member_for_assets(ack, body, client, logger):
     ack()
     try:
-        # parse selection payload
+        # 1) parse selection payload
         sel = body["actions"][0]["selected_option"]["value"]
         data = json.loads(sel)  # {"uid":..., "name":..., "email":...}
         uid = int(data["uid"])
         full_name = data.get("name") or ""
         email = data.get("email") or ""
 
-        # safely resolve channel_id / thread_ts (avoid calling .get on str)
+        # 2) safely resolve channel_id / thread_ts
+        channel_id = None
+        thread_ts = None
+
         container = body.get("container")
         if isinstance(container, dict):
-            channel_id = container.get("channel_id")
-            thread_ts = container.get("message_ts")
-        else:
-            channel_id = None
-            thread_ts = None
+            channel_id = container.get("channel_id") or channel_id
+            thread_ts = container.get("message_ts") or thread_ts
 
         ch = body.get("channel")
         if not channel_id:
@@ -294,12 +294,14 @@ def handle_pick_member_for_assets(ack, body, client, logger):
 
         msg = body.get("message")
         if not thread_ts and isinstance(msg, dict):
-            thread_ts = msg.get("ts")
+            # prefer thread_ts if present, otherwise use ts
+            thread_ts = msg.get("thread_ts") or msg.get("ts")
 
-        if not thread_ts:
-            thread_ts = body.get("message_ts") or (container.get("message_ts") if isinstance(container, dict) else None)
+        # final fallback for message_ts at top-level (ensure not calling .get on str)
+        if not thread_ts and isinstance(body, dict) and isinstance(body.get("message_ts"), str):
+            thread_ts = body.get("message_ts")
 
-        # fetch assets for the selected member
+        # 3) fetch assets for the selected member
         assets = AS.get_assets_possessions_of_user(uid, include_custom_fields=False, max_pages=10)
         if not assets:
             client.chat_postMessage(
@@ -309,7 +311,7 @@ def handle_pick_member_for_assets(ack, body, client, logger):
             )
             return
 
-        # format and reply
+        # 4) format and reply (English only)
         blocks, csv_path = FX.format_assets_list(
             f"Assets for *{full_name}* <{email}>",
             assets,
@@ -334,13 +336,14 @@ def handle_pick_member_for_assets(ack, body, client, logger):
     except Exception as e:
         logger.exception("pick_member_for_assets failed")
         try:
+            # safe re-resolve channel/thread for error message
+            channel_id = None
+            thread_ts = None
+
             container = body.get("container")
             if isinstance(container, dict):
-                channel_id = container.get("channel_id")
-                thread_ts = container.get("message_ts")
-            else:
-                channel_id = None
-                thread_ts = None
+                channel_id = container.get("channel_id") or channel_id
+                thread_ts = container.get("message_ts") or thread_ts
 
             ch = body.get("channel")
             if not channel_id:
@@ -351,7 +354,7 @@ def handle_pick_member_for_assets(ack, body, client, logger):
 
             msg = body.get("message")
             if not thread_ts and isinstance(msg, dict):
-                thread_ts = msg.get("ts")
+                thread_ts = msg.get("thread_ts") or msg.get("ts")
 
             if channel_id:
                 client.chat_postMessage(
