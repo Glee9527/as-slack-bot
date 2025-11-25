@@ -88,12 +88,30 @@ def get_assets_possessions_of_user(user_id: int, include_custom_fields=False, ma
         }
         if include_custom_fields:
             params["include_custom_fields"] = "true"
+
         data = _get("assets/filter.api", params=params)
-        items = data or []
+
+        # ✅ Normalize payload shape:
+        # - list -> use as-is
+        # - dict with "assets"/"rows"/"data" -> extract list
+        # - anything else -> empty list
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("assets") or data.get("rows") or data.get("data") or []
+        else:
+            items = []
+
+        # ✅ Keep only dict items to avoid `'str'.get` downstream
+        items = [x for x in items if isinstance(x, dict)]
+
         results.extend(items)
+
+        # pagination heuristic: stop if this page has fewer than 25 items
         if len(items) < 25:
             break
         page += 1
+
     return results
 
 def find_assets_by_assignee_email_fast(email: str, include_custom_fields=False, max_pages=10):
