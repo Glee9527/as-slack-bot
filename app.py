@@ -12,6 +12,7 @@ ssl._create_default_https_context = lambda *args, **kwargs: ssl.create_default_c
 
 import json
 import os
+import re  # ✅ 新增：用於判斷 AIN/序號
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
@@ -34,10 +35,13 @@ flask_app = Flask(__name__)
 
 @app.command("/asset")
 def handle_asset_command(ack, body, client, logger):
+    # 先 ACK（避免 3 秒超時）
     ack()
+
     text = (body.get("text") or "").strip()
     channel_id = body.get("channel_id")
 
+    # 發一則訊息作為 thread anchor
     searching_msg = client.chat_postMessage(
         channel=channel_id,
         text=":mag: Searching, please wait..."
@@ -100,13 +104,94 @@ def handle_asset_command(ack, body, client, logger):
 
         # === 查詢分支 ===
         if itype == "user_or_asset_lookup":
-            q = intent_data.get("query")
-            data = AS.find_user_assets(q)
-            blocks, csv_path = FX.format_assets_list(
-                f"Results for your query: *{text}*",
-                data.get("assets", []),
-                fields=fields
-            )
+            q = (intent_data.get("query") or text or "").strip()
+
+            # 路徑 A：Email（intent 方案A已抽乾淨，這裡仍保底判斷）
+            if "@" in q:
+                data = AS.find_user_assets(q)
+                assets = data.get("assets", [])
+                blocks, csv_path = FX.format_assets_list(
+                    f"Results for your query: *{text}*",
+                    assets,
+                    fields=fields
+                )
+
+            else:
+                # 路徑 B：AIN / 序號 → 仍走 find_user_assets（內含 quick_search）
+                is_ain = re.match(r"^[A-Za-z]{2}\d{3,}$", q)
+                is_serial = len(q) > 6 and q.isalnum()
+                if is_ain or is_serial:
+                    data = AS.find_user_assets(q)
+                    assets = data.get("assets", [])
+                    blocks, csv_path = FX.format_assets_list(
+                        f"Results for your query: *{text}*",
+                        assets,
+                        fields=fields
+                    )
+                else:
+                    # 路徑 C：姓名 → 先跑「姓名消歧」：唯一命中直接回資產，多位則出下拉清單（只顯示姓名與 email）
+                    res = AS.find_assets_by_person_name(q, include_custom_fields=False)
+
+                    if res.get("assets"):  # 唯一命中
+                        m = res.get("member") or {}
+                        full_name = ("{} {}".format(m.get("first_name") or "", m.get("last_name") or "")).strip()
+                        email = m.get("email") or ""
+                        assets = res["assets"]
+
+                        blocks, csv_path = FX.format_assets_list(
+                            f"Results for your query: *{text}* (member: {full_name} <{email}>)",
+                            assets,
+                            fields=fields
+                        )
+
+                    else:
+                        candidates = res.get("candidates") or []
+                        if candidates:
+                            # 建立只含「姓名 — email」的 static_select
+                            options = []
+                            for c in candidates:
+                                full_name = ("{} {}".format(c.get("first_name") or "", c.get("last_name") or "")).strip() or "(no name)"
+                                label = full_name + (f" — {c.get('email')}" if c.get("email") else "")
+                                value = json.dumps({"uid": c["id"], "name": full_name, "email": c.get("email")})
+                                options.append({
+                                    "text": {"type": "plain_text", "text": label[:75]},
+                                    "value": value
+                                })
+
+                            # 直接在 thread 送出消歧清單並提前結束
+                            client.chat_update(
+                                channel=channel_id,
+                                ts=thread_ts,
+                                text="🔎 Multiple matches found. Please pick one below."
+                            )
+                            client.chat_postMessage(
+                                channel=channel_id,
+                                thread_ts=thread_ts,
+                                text=f"我找到多位「{q}」，請選擇正確的人：",
+                                blocks=[
+                                    {
+                                        "type": "section",
+                                        "text": {"type": "mrkdwn", "text": f"我找到多位 *{q}*，請選擇正確的人（只顯示姓名與 email）："}
+                                    },
+                                    {
+                                        "type": "actions",
+                                        "elements": [
+                                            {
+                                                "type": "static_select",
+                                                "action_id": "pick_member_for_assets",
+                                                "placeholder": {"type": "plain_text", "text": "選擇正確的人"},
+                                                "options": options
+                                            }
+                                        ]
+                                    }
+                                ]
+                            )
+                            return
+                        else:
+                            # 無候選
+                            blocks = [
+                                {"type": "section", "text": {"type": "mrkdwn", "text": f"找不到與「{q}」相關的人或資產。你可以改試 email、序號或 AIN。"}}
+                            ]
 
         elif itype == "license_expiry":
             days = int(intent_data.get("days", 30))
@@ -166,6 +251,7 @@ def handle_asset_command(ack, body, client, logger):
 
         # === 上傳 CSV （如有需要） ===
         if csv_path:
+            # 按工具說明，請直接用本地檔案路徑；平台會轉成可下載連結
             permalink = upload_csv_to_slack(csv_path, channel_id, title="Results CSV", thread_ts=thread_ts)
             if permalink:
                 client.chat_postMessage(
@@ -181,6 +267,65 @@ def handle_asset_command(ack, body, client, logger):
             thread_ts=thread_ts,
             text=f":x: Query failed: {e}"
         )
+
+
+# === 新增：處理姓名消歧選擇 ===
+@app.action("pick_member_for_assets")
+def handle_pick_member_for_assets(ack, body, client, logger):
+    ack()
+    try:
+        sel = body["actions"][0]["selected_option"]["value"]
+        data = json.loads(sel)  # {"uid":..., "name":..., "email":...}
+        uid = int(data["uid"])
+        full_name = data.get("name") or ""
+        email = data.get("email") or ""
+
+        channel_id = body["container"].get("channel_id") or body.get("channel", {}).get("id")
+        thread_ts = body["container"].get("message_ts") or body.get("message", {}).get("ts")
+
+        assets = AS.get_assets_possessions_of_user(uid, include_custom_fields=False, max_pages=10)
+        if not assets:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=f"「{full_name}」<{email}> 沒有找到資產。"
+            )
+            return
+
+        blocks, csv_path = FX.format_assets_list(
+            f"Assets for *{full_name}* <{email}>",
+            assets,
+            fields=["asset_name","ain","serial_number","purchased_on","assigned_to_user_name"]
+        )
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=f"Found {len(assets)} assets for *{full_name}* <{email}>",
+            blocks=blocks
+        )
+
+        if csv_path:
+            permalink = upload_csv_to_slack(csv_path, channel_id, title="Results CSV", thread_ts=thread_ts)
+            if permalink:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"📎 [Download CSV here]({permalink})"
+                )
+
+    except Exception as e:
+        logger.exception("pick_member_for_assets failed")
+        try:
+            channel_id = body.get("channel", {}).get("id") or body.get("container", {}).get("channel_id")
+            thread_ts = body.get("container", {}).get("message_ts")
+            if channel_id:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"抱歉，處理你的選擇時發生錯誤：{e}"
+                )
+        except Exception:
+            pass
 
 
 @flask_app.route("/slack/events", methods=["POST"])
