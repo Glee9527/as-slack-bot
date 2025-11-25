@@ -148,7 +148,14 @@ def handle_asset_command(ack, body, client, logger):
                             for c in candidates:
                                 full_name = ("{} {}".format(c.get("first_name") or "", c.get("last_name") or "")).strip() or "(no name)"
                                 label = full_name + (f" — {c.get('email')}" if c.get("email") else "")
-                                value = json.dumps({"uid": c["id"], "name": full_name, "email": c.get("email")})
+                                # ✅ Pass channel_id & thread_ts into value to avoid reading Slack body later
+                                value = json.dumps({
+                                    "uid": c["id"],
+                                    "name": full_name,
+                                    "email": c.get("email"),
+                                    "channel_id": channel_id,
+                                    "thread_ts": thread_ts,
+                                })
                                 options.append({
                                     "text": {"type": "plain_text", "text": label[:75]},
                                     "value": value
@@ -271,37 +278,14 @@ def handle_pick_member_for_assets(ack, body, client, logger):
     try:
         # 1) parse selection payload
         sel = body["actions"][0]["selected_option"]["value"]
-        data = json.loads(sel)  # {"uid":..., "name":..., "email":...}
+        data = json.loads(sel)  # {"uid","name","email","channel_id","thread_ts"}
         uid = int(data["uid"])
         full_name = data.get("name") or ""
         email = data.get("email") or ""
+        channel_id = data.get("channel_id")
+        thread_ts = data.get("thread_ts")
 
-        # 2) safely resolve channel_id / thread_ts
-        channel_id = None
-        thread_ts = None
-
-        container = body.get("container")
-        if isinstance(container, dict):
-            channel_id = container.get("channel_id") or channel_id
-            thread_ts = container.get("message_ts") or thread_ts
-
-        ch = body.get("channel")
-        if not channel_id:
-            if isinstance(ch, dict):
-                channel_id = ch.get("id")
-            elif isinstance(ch, str):
-                channel_id = ch
-
-        msg = body.get("message")
-        if not thread_ts and isinstance(msg, dict):
-            # prefer thread_ts if present, otherwise use ts
-            thread_ts = msg.get("thread_ts") or msg.get("ts")
-
-        # final fallback for message_ts at top-level (ensure not calling .get on str)
-        if not thread_ts and isinstance(body, dict) and isinstance(body.get("message_ts"), str):
-            thread_ts = body.get("message_ts")
-
-        # 3) fetch assets for the selected member
+        # 2) fetch assets for the selected member
         assets = AS.get_assets_possessions_of_user(uid, include_custom_fields=False, max_pages=10)
         if not assets:
             client.chat_postMessage(
@@ -311,7 +295,7 @@ def handle_pick_member_for_assets(ack, body, client, logger):
             )
             return
 
-        # 4) format and reply (English only)
+        # 3) format and reply (English only)
         blocks, csv_path = FX.format_assets_list(
             f"Assets for *{full_name}* <{email}>",
             assets,
@@ -336,26 +320,9 @@ def handle_pick_member_for_assets(ack, body, client, logger):
     except Exception as e:
         logger.exception("pick_member_for_assets failed")
         try:
-            # safe re-resolve channel/thread for error message
-            channel_id = None
-            thread_ts = None
-
-            container = body.get("container")
-            if isinstance(container, dict):
-                channel_id = container.get("channel_id") or channel_id
-                thread_ts = container.get("message_ts") or thread_ts
-
-            ch = body.get("channel")
-            if not channel_id:
-                if isinstance(ch, dict):
-                    channel_id = ch.get("id")
-                elif isinstance(ch, str):
-                    channel_id = ch
-
-            msg = body.get("message")
-            if not thread_ts and isinstance(msg, dict):
-                thread_ts = msg.get("thread_ts") or msg.get("ts")
-
+            # use safest fallback if something is missing
+            channel_id = data.get("channel_id") if isinstance(data, dict) else None
+            thread_ts = data.get("thread_ts") if isinstance(data, dict) else None
             if channel_id:
                 client.chat_postMessage(
                     channel=channel_id,
