@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from functools import lru_cache  # ★ 新增：快取成員清單
+from functools import lru_cache  # cache members pages
 
 AS_SECRET = os.getenv("AS_SECRET_KEY")
 AS_SUBDOMAIN = os.getenv("AS_SUBDOMAIN", "shopback")
@@ -107,14 +107,14 @@ def find_user_assets(query: str, limit=200):
     """
     Search assets by user email, name, AIN, or serial.
     Email/name → server-side if possible; AIN/Serial → quick_search fallback.
-    （若要「姓名消歧清單」，請改呼叫 find_assets_by_person_name()）
+    (If you need name disambiguation, call find_assets_by_person_name().)
     """
     query_lower = query.lower()
     is_email = "@" in query
     is_ain = re.match(r"^[A-Za-z]{2}\d{3,}$", query)
     is_serial = len(query) > 6 and query.isalnum()
 
-    # --- Fast path for email ---
+    # Fast path for email
     m = EMAIL_RE.search(query)
     if m:
         email = m.group(0)
@@ -129,7 +129,7 @@ def find_user_assets(query: str, limit=200):
         if quick:
             return {"user": None, "assets": quick}
 
-    # Fallback full scan
+    # Fallback full scan by fields
     page = 1
     while True:
         data = _get("assets.api", params={"page": page, "limit": limit})
@@ -155,19 +155,19 @@ def find_user_assets(query: str, limit=200):
     return {"user": None, "assets": matched}
 
 # =============================================================
-# ★ 新增：姓名搜尋 + 只回傳「姓名與 email」的消歧清單
+# Name search + disambiguation (return only name & email for candidates)
 # =============================================================
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 def _tokenize_name(name: str):
-    # 把 "George Li" -> ["george","li"]；支援多空白/全形空白
+    # "George Li" -> ["george", "li"]; supports multiple/ideographic spaces
     return [t for t in re.split(r"[\s\u3000]+", (name or "").strip()) if t]
 
 @lru_cache(maxsize=512)
 def _get_all_members_pages(max_pages: int = 20, only_active: bool = True):
-    """快取抓取 members 清單（每頁 25）。只抓前 N 頁以控制延遲。"""
+    """Cached retrieval of members list (25 per page)."""
     people = []
     page = 1
     while page <= max_pages:
@@ -186,8 +186,8 @@ def _get_all_members_pages(max_pages: int = 20, only_active: bool = True):
 
 def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = True):
     """
-    以姓名模糊搜尋成員。回傳 list[member]（原始結構）。
-    規則：完整姓名（名+姓）完全相等優先；其次為 token 的開頭/子字串計分。
+    Fuzzy search members by name.
+    Priority: exact full-name match > token prefix matches > name/display_name substring > email substring.
     """
     tokens = [_norm(t) for t in _tokenize_name(name)]
     if not tokens:
@@ -199,9 +199,11 @@ def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = T
     for m in people:
         first = _norm(m.get("first_name"))
         last  = _norm(m.get("last_name"))
+        # display field we will use for broader matching
         disp  = _norm(m.get("name") or m.get("display_name") or f"{first} {last}".strip())
         email = _norm(m.get("email"))
 
+        # full name equality (first + last) gets highest score
         full_eq = False
         if len(tokens) >= 2:
             full_eq = (tokens[0] == first and tokens[1] == last) or (" ".join(tokens) == f"{first} {last}".strip())
@@ -209,11 +211,14 @@ def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = T
         score = 0
         if full_eq:
             score += 100
+
+        # token-based scoring
         for t in tokens:
             if first.startswith(t): score += 10
             if last.startswith(t):  score += 10
-            if t in disp:           score += 4
-            if t in email:          score += 2
+            # --- Improvement #2: broader match on name/display_name with stronger weight
+            if t in disp:          score += 15
+            if t in email:         score += 2
 
         if score > 0:
             scored.append((score, m))
@@ -223,13 +228,13 @@ def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = T
 
 def find_assets_by_person_name(name: str, include_custom_fields: bool = False, max_pages: int = 10):
     """
-    以「姓名」找資產：
-    - 若唯一高分命中（或有一筆 full match），直接 possessions_of。
-    - 否則回傳 candidates（僅含 姓名 + email + id），由上層做消歧。
-    回傳：
-      - 唯一命中：{"candidates": [], "member": {...}, "assets": [...]}
-      - 多位候選：{"candidates": [{"id","first_name","last_name","email"}, ...], "assets": []}
-      - 無結果：{"candidates": [], "assets": []}
+    Find assets by human name:
+      - If exactly one strong match (or one full-name match): fetch possessions_of.
+      - Otherwise return candidates with only name & email (and id) for disambiguation.
+    Returns:
+      - Unique: {"candidates": [], "member": {...}, "assets": [...]}
+      - Multiple: {"candidates": [{"id","first_name","last_name","email"}, ...], "assets": []}
+      - None: {"candidates": [], "assets": []}
     """
     candidates = search_members_by_name(name)
     if not candidates:
@@ -263,13 +268,13 @@ def find_assets_by_person_name(name: str, include_custom_fields: bool = False, m
             "assets": assets
         }
 
-    # 僅回傳姓名+email（依你的要求）
+    # Return only name + email for disambiguation
     slim = [{
         "id": c.get("id") or c.get("user_id"),
         "first_name": c.get("first_name"),
         "last_name": c.get("last_name"),
         "email": c.get("email"),
-    } for c in candidates[:15]]  # 最多帶回 15 個候選
+    } for c in candidates[:15]]
     return {"candidates": slim, "assets": []}
 
 # =============================================================
