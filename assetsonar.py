@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from functools import lru_cache  # ★ 新增：快取成員清單
 
 AS_SECRET = os.getenv("AS_SECRET_KEY")
 AS_SUBDOMAIN = os.getenv("AS_SUBDOMAIN", "shopback")
@@ -58,7 +59,7 @@ def quick_search(query: str):
         print(f"Quick search error: {e}")
         return []
 
-# --- New: Use AssetSonar server filters for faster email search ---
+# --- Use AssetSonar server filters for faster email search ---
 def get_member_by_email(email: str):
     """Fetch member record by email."""
     params = {"page": 1, "filter": "email", "filter_val": email}
@@ -106,6 +107,7 @@ def find_user_assets(query: str, limit=200):
     """
     Search assets by user email, name, AIN, or serial.
     Email/name → server-side if possible; AIN/Serial → quick_search fallback.
+    （若要「姓名消歧清單」，請改呼叫 find_assets_by_person_name()）
     """
     query_lower = query.lower()
     is_email = "@" in query
@@ -150,9 +152,127 @@ def find_user_assets(query: str, limit=200):
     if matched:
         if is_email:
             return {"user": {"name": query}, "assets": matched}
-        else:
-            return {"user": None, "assets": matched}
-    return {"user": None, "assets": []}
+    return {"user": None, "assets": matched}
+
+# =============================================================
+# ★ 新增：姓名搜尋 + 只回傳「姓名與 email」的消歧清單
+# =============================================================
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _tokenize_name(name: str):
+    # 把 "George Li" -> ["george","li"]；支援多空白/全形空白
+    return [t for t in re.split(r"[\s\u3000]+", (name or "").strip()) if t]
+
+@lru_cache(maxsize=512)
+def _get_all_members_pages(max_pages: int = 20, only_active: bool = True):
+    """快取抓取 members 清單（每頁 25）。只抓前 N 頁以控制延遲。"""
+    people = []
+    page = 1
+    while page <= max_pages:
+        params = {"page": page}
+        if only_active:
+            params["filter"] = "status"
+            params["filter_val"] = "active"
+        data = _get("members.api", params=params)  # list[member]
+        if not isinstance(data, list) or not data:
+            break
+        people.extend(data)
+        if len(data) < 25:
+            break
+        page += 1
+    return people
+
+def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = True):
+    """
+    以姓名模糊搜尋成員。回傳 list[member]（原始結構）。
+    規則：完整姓名（名+姓）完全相等優先；其次為 token 的開頭/子字串計分。
+    """
+    tokens = [_norm(t) for t in _tokenize_name(name)]
+    if not tokens:
+        return []
+
+    people = _get_all_members_pages(max_pages=max_pages, only_active=only_active)
+    scored = []
+
+    for m in people:
+        first = _norm(m.get("first_name"))
+        last  = _norm(m.get("last_name"))
+        disp  = _norm(m.get("name") or m.get("display_name") or f"{first} {last}".strip())
+        email = _norm(m.get("email"))
+
+        full_eq = False
+        if len(tokens) >= 2:
+            full_eq = (tokens[0] == first and tokens[1] == last) or (" ".join(tokens) == f"{first} {last}".strip())
+
+        score = 0
+        if full_eq:
+            score += 100
+        for t in tokens:
+            if first.startswith(t): score += 10
+            if last.startswith(t):  score += 10
+            if t in disp:           score += 4
+            if t in email:          score += 2
+
+        if score > 0:
+            scored.append((score, m))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for _, m in scored]
+
+def find_assets_by_person_name(name: str, include_custom_fields: bool = False, max_pages: int = 10):
+    """
+    以「姓名」找資產：
+    - 若唯一高分命中（或有一筆 full match），直接 possessions_of。
+    - 否則回傳 candidates（僅含 姓名 + email + id），由上層做消歧。
+    回傳：
+      - 唯一命中：{"candidates": [], "member": {...}, "assets": [...]}
+      - 多位候選：{"candidates": [{"id","first_name","last_name","email"}, ...], "assets": []}
+      - 無結果：{"candidates": [], "assets": []}
+    """
+    candidates = search_members_by_name(name)
+    if not candidates:
+        return {"candidates": [], "assets": []}
+
+    tokens = [_norm(t) for t in _tokenize_name(name)]
+
+    def _is_full_eq(m):
+        first = _norm(m.get("first_name"))
+        last  = _norm(m.get("last_name"))
+        return len(tokens) >= 2 and tokens[0] == first and tokens[1] == last
+
+    full_matches = [m for m in candidates if _is_full_eq(m)]
+    target = None
+    if len(full_matches) == 1:
+        target = full_matches[0]
+    elif len(candidates) == 1:
+        target = candidates[0]
+
+    if target:
+        uid = target.get("id") or target.get("user_id")
+        assets = get_assets_possessions_of_user(int(uid), include_custom_fields=include_custom_fields, max_pages=max_pages)
+        return {
+            "candidates": [],
+            "member": {
+                "id": uid,
+                "first_name": target.get("first_name"),
+                "last_name": target.get("last_name"),
+                "email": target.get("email"),
+            },
+            "assets": assets
+        }
+
+    # 僅回傳姓名+email（依你的要求）
+    slim = [{
+        "id": c.get("id") or c.get("user_id"),
+        "first_name": c.get("first_name"),
+        "last_name": c.get("last_name"),
+        "email": c.get("email"),
+    } for c in candidates[:15]]  # 最多帶回 15 個候選
+    return {"candidates": slim, "assets": []}
+
+# =============================================================
 
 def licenses_expiring_within(days: int = 10):
     """Fetch all software licenses expiring within N days."""
