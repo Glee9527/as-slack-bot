@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from dateutil import parser as dtparser
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from functools import lru_cache  # cache members pages
+from functools import lru_cache
 
 AS_SECRET = os.getenv("AS_SECRET_KEY")
 AS_SUBDOMAIN = os.getenv("AS_SUBDOMAIN", "shopback")
@@ -18,7 +18,7 @@ HEADERS = {"token": AS_SECRET or "65c020957ea3152a3267ec4b30240192"}
 PAGE_SIZE = 25
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-# --- Session setup with retry and timeout ---
+# --- Session with retry/timeout ---
 _session = requests.Session()
 _session.mount("https://", HTTPAdapter(max_retries=Retry(
     total=3, connect=3, read=3,
@@ -59,16 +59,21 @@ def quick_search(query: str):
         print(f"Quick search error: {e}")
         return []
 
-# --- Use AssetSonar server filters for faster email search ---
+# -------- email -> assets (fast path) --------
 def get_member_by_email(email: str):
     """Fetch member record by email."""
     params = {"page": 1, "filter": "email", "filter_val": email}
     data = _get("members.api", params=params)
-    if isinstance(data, list) and data:
-        for m in data:
+    members = []
+    if isinstance(data, list):
+        members = data
+    elif isinstance(data, dict) and "members" in data:
+        members = data["members"]
+    if members:
+        for m in members:
             if str(m.get("email", "")).lower() == email.lower():
                 return m
-        return data[0]
+        return members[0]
     return None
 
 def get_assets_possessions_of_user(user_id: int, include_custom_fields=False, max_pages=10):
@@ -149,14 +154,11 @@ def find_user_assets(query: str, limit=200):
             break
         page += 1
 
-    if matched:
-        if is_email:
-            return {"user": {"name": query}, "assets": matched}
+    if matched and is_email:
+        return {"user": {"name": query}, "assets": matched}
     return {"user": None, "assets": matched}
 
-# =============================================================
-# Name search + disambiguation (return only name & email for candidates)
-# =============================================================
+# ====================== Name search + disambiguation ======================
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
@@ -165,23 +167,39 @@ def _tokenize_name(name: str):
     # "George Li" -> ["george", "li"]; supports multiple/ideographic spaces
     return [t for t in re.split(r"[\s\u3000]+", (name or "").strip()) if t]
 
+def _extract_members_payload(data):
+    """Accept both list and {'members': [...]} shapes."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "members" in data and isinstance(data["members"], list):
+        return data["members"]
+    return []
+
 @lru_cache(maxsize=512)
 def _get_all_members_pages(max_pages: int = 20, only_active: bool = True):
-    """Cached retrieval of members list (25 per page)."""
-    people = []
-    page = 1
-    while page <= max_pages:
-        params = {"page": page}
-        if only_active:
-            params["filter"] = "status"
-            params["filter_val"] = "active"
-        data = _get("members.api", params=params)  # list[member]
-        if not isinstance(data, list) or not data:
-            break
-        people.extend(data)
-        if len(data) < 25:
-            break
-        page += 1
+    """Cached retrieval of members (retry without active-filter if empty)."""
+    def _fetch(only_active_flag: bool):
+        people = []
+        page = 1
+        while page <= max_pages:
+            params = {"page": page}
+            if only_active_flag:
+                params["filter"] = "status"
+                params["filter_val"] = "active"
+            data = _get("members.api", params=params)
+            members = _extract_members_payload(data)
+            if not members:
+                break
+            people.extend(members)
+            if len(members) < 25:
+                break
+            page += 1
+        return people
+
+    people = _fetch(True if only_active else False)
+    if not people and only_active:
+        # Fallback: try again without status=active filter
+        people = _fetch(False)
     return people
 
 def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = True):
@@ -194,30 +212,30 @@ def search_members_by_name(name: str, max_pages: int = 20, only_active: bool = T
         return []
 
     people = _get_all_members_pages(max_pages=max_pages, only_active=only_active)
-    scored = []
+    if not people:
+        return []
 
+    scored = []
     for m in people:
         first = _norm(m.get("first_name"))
         last  = _norm(m.get("last_name"))
-        # display field we will use for broader matching
         disp  = _norm(m.get("name") or m.get("display_name") or f"{first} {last}".strip())
         email = _norm(m.get("email"))
 
         # full name equality (first + last) gets highest score
-        full_eq = False
-        if len(tokens) >= 2:
-            full_eq = (tokens[0] == first and tokens[1] == last) or (" ".join(tokens) == f"{first} {last}".strip())
+        full_eq = (len(tokens) >= 2) and (
+            (tokens[0] == first and tokens[1] == last) or
+            (" ".join(tokens) == f"{first} {last}".strip())
+        )
 
         score = 0
         if full_eq:
             score += 100
 
-        # token-based scoring
         for t in tokens:
             if first.startswith(t): score += 10
             if last.startswith(t):  score += 10
-            # --- Improvement #2: broader match on name/display_name with stronger weight
-            if t in disp:          score += 15
+            if t in disp:          score += 15    # broader match on name/display_name
             if t in email:         score += 2
 
         if score > 0:
@@ -231,10 +249,6 @@ def find_assets_by_person_name(name: str, include_custom_fields: bool = False, m
     Find assets by human name:
       - If exactly one strong match (or one full-name match): fetch possessions_of.
       - Otherwise return candidates with only name & email (and id) for disambiguation.
-    Returns:
-      - Unique: {"candidates": [], "member": {...}, "assets": [...]}
-      - Multiple: {"candidates": [{"id","first_name","last_name","email"}, ...], "assets": []}
-      - None: {"candidates": [], "assets": []}
     """
     candidates = search_members_by_name(name)
     if not candidates:
@@ -277,7 +291,7 @@ def find_assets_by_person_name(name: str, include_custom_fields: bool = False, m
     } for c in candidates[:15]]
     return {"candidates": slim, "assets": []}
 
-# =============================================================
+# ====================== Other helpers ======================
 
 def licenses_expiring_within(days: int = 10):
     """Fetch all software licenses expiring within N days."""
